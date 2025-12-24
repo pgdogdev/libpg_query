@@ -232,6 +232,7 @@ static void deparseJsonQuotesClauseOpt(DeparseState *state, JsonQuotes quotes);
 static void deparseJsonOnErrorClauseOpt(DeparseState *state, JsonBehavior *behavior);
 static void deparseJsonOnEmptyClauseOpt(DeparseState *state, JsonBehavior *behavior);
 static void deparseConstraint(DeparseState *state, Constraint *constraint);
+static void deparseATAlterConstraint(DeparseState *state, ATAlterConstraint *constraint);
 static void deparseSchemaStmt(DeparseState *state, Node *node);
 static void deparseExecuteStmt(DeparseState *state, ExecuteStmt *execute_stmt);
 static void deparseTriggerTransition(DeparseState *state, TriggerTransition *trigger_transition);
@@ -1712,6 +1713,23 @@ static void deparseColumnList(DeparseState *state, List *columns)
 	}
 }
 
+// "opt_column_and_period_list" and "optionalPeriodName" in gram.y
+static void deparseColumnListWithPeriod(DeparseState *state, List *columns)
+{
+	ListCell *lc = NULL;
+	foreach(lc, columns)
+	{
+		bool not_last = lnext(columns, lc);
+		if (!not_last)
+			deparseAppendStringInfoString(state, "PERIOD ");
+
+		deparseAppendStringInfoString(state, quote_identifier(strVal(lfirst(lc))));
+
+		if (not_last)
+			deparseAppendStringInfoString(state, ", ");
+	}
+}
+
 // "OptTemp" in gram.y
 //
 // Note this method adds a trailing space if a value is output
@@ -2646,6 +2664,9 @@ static void deparsePrivilegeTarget(DeparseState *state, GrantTargetType targtype
 					break;
 				case OBJECT_SCHEMA:
 					deparseAppendStringInfoString(state, "SCHEMAS");
+					break;
+				case OBJECT_LARGEOBJECT:
+					deparseAppendStringInfoString(state, "LARGE OBJECTS");
 					break;
 				default:
 					// Other types are not supported here
@@ -5442,7 +5463,11 @@ static void deparseConstraint(DeparseState *state, Constraint *constraint)
 			Assert(constraint->generated_when == ATTRIBUTE_IDENTITY_ALWAYS);
 			deparseAppendStringInfoString(state, "GENERATED ALWAYS AS (");
 			deparseExpr(state, constraint->raw_expr, DEPARSE_NODE_CONTEXT_A_EXPR);
-			deparseAppendStringInfoString(state, ") STORED ");
+			deparseAppendStringInfoString(state, ") ");
+			if (constraint->generated_kind == ATTRIBUTE_GENERATED_STORED)
+				deparseAppendStringInfoString(state, "STORED ");
+			else
+				deparseAppendStringInfoString(state, "VIRTUAL ");
 			break;
 		case CONSTR_CHECK:
 			deparseAppendStringInfoString(state, "CHECK (");
@@ -5510,24 +5535,38 @@ static void deparseConstraint(DeparseState *state, Constraint *constraint)
 
 	if (list_length(constraint->keys) > 0)
 	{
-		bool valueOnly = false;
+		bool emit_keys = true;
+		bool needs_parens = true;
 
-		if (list_length(constraint->keys) == 1) {
-			Node* firstKey = constraint->keys->elements[0].ptr_value;
-			valueOnly = IsA(firstKey, String) && !strcmp("value", ((String*)firstKey)->sval);
+		if (list_length(constraint->keys) == 1)
+		{
+			Node* key = linitial(constraint->keys);
+			emit_keys = !(IsA(key, String) && strcmp(castNode(String, key)->sval, "value") == 0);
+			needs_parens = constraint->contype != CONSTR_NULL && constraint->contype != CONSTR_NOTNULL;
 		}
 
-		if (!valueOnly) {
+		if (needs_parens)
 			deparseAppendStringInfoChar(state, '(');
+
+		if (emit_keys)
 			deparseColumnList(state, constraint->keys);
-			deparseAppendStringInfoString(state, ") ");
-		}
+
+		if (constraint->without_overlaps)
+			deparseAppendStringInfoString(state, " WITHOUT OVERLAPS");
+
+		if (needs_parens)
+			deparseAppendStringInfoChar(state, ')');
+
+		deparseAppendStringInfoChar(state, ' ');
 	}
 
 	if (list_length(constraint->fk_attrs) > 0)
 	{
 		deparseAppendStringInfoChar(state, '(');
-		deparseColumnList(state, constraint->fk_attrs);
+		if (constraint->fk_with_period)
+			deparseColumnListWithPeriod(state, constraint->fk_attrs);
+		else
+			deparseColumnList(state, constraint->fk_attrs);
 		deparseAppendStringInfoString(state, ") ");
 	}
 
@@ -5539,7 +5578,10 @@ static void deparseConstraint(DeparseState *state, Constraint *constraint)
 		if (list_length(constraint->pk_attrs) > 0)
 		{
 			deparseAppendStringInfoChar(state, '(');
-			deparseColumnList(state, constraint->pk_attrs);
+			if (constraint->pk_with_period)
+				deparseColumnListWithPeriod(state, constraint->pk_attrs);
+			else
+				deparseColumnList(state, constraint->pk_attrs);
 			deparseAppendStringInfoString(state, ") ");
 		}
 	}
@@ -5652,9 +5694,53 @@ static void deparseConstraint(DeparseState *state, Constraint *constraint)
 	if (constraint->is_no_inherit)
 		deparseAppendStringInfoString(state, "NO INHERIT ");
 
+	if ((constraint->contype == CONSTR_FOREIGN || constraint->contype == CONSTR_CHECK) && !constraint->is_enforced)
+		deparseAppendStringInfoString(state, "NOT ENFORCED ");
+
 	if (constraint->skip_validation)
 		deparseAppendStringInfoString(state, "NOT VALID ");
 	
+	removeTrailingSpace(state);
+}
+
+// "ALTER CONSTRAINT name ConstraintAttributeSpec" in gram.y
+static void deparseATAlterConstraint(DeparseState *state, ATAlterConstraint *constraint)
+{
+	ListCell *lc;
+
+	if (constraint->conname != NULL)
+	{
+		deparseAppendStringInfoString(state, "CONSTRAINT ");
+		deparseAppendStringInfoString(state, quote_identifier(constraint->conname));
+		deparseAppendStringInfoChar(state, ' ');
+	}
+
+	if (constraint->alterEnforceability)
+	{
+		if (constraint->is_enforced)
+			deparseAppendStringInfoString(state, "ENFORCED ");
+		else
+			deparseAppendStringInfoString(state, "NOT ENFORCED ");
+	}
+
+	if (constraint->alterDeferrability)
+	{
+		if (constraint->initdeferred)
+			deparseAppendStringInfoString(state, "INITIALLY DEFERRED ");
+		else if (constraint->deferrable)
+			deparseAppendStringInfoString(state, "DEFERRABLE ");
+		else
+			deparseAppendStringInfoString(state, "NOT DEFERRABLE ");
+	}
+
+	if (constraint->alterInheritability)
+	{
+		if (constraint->noinherit)
+			deparseAppendStringInfoString(state, "NO INHERIT ");
+		else
+			deparseAppendStringInfoString(state, "INHERIT ");
+	}
+
 	removeTrailingSpace(state);
 }
 
@@ -7265,7 +7351,7 @@ static void deparseAlterTableCmd(DeparseState *state, AlterTableCmd *alter_table
 			break;
 		case AT_DetachPartitionFinalize:
 			deparsePartitionCmd(state, castNode(PartitionCmd, alter_table_cmd->def));
-			deparseAppendStringInfoString(state, "FINALIZE ");
+			deparseAppendStringInfoString(state, " FINALIZE ");
 			break;
 		case AT_AddColumn:
 		case AT_AlterColumnType:
@@ -7306,8 +7392,11 @@ static void deparseAlterTableCmd(DeparseState *state, AlterTableCmd *alter_table
 			break;
 		case AT_AddIdentity:
 		case AT_AddConstraint:
-		case AT_AlterConstraint:
 			deparseConstraint(state, castNode(Constraint, alter_table_cmd->def));
+			deparseAppendStringInfoChar(state, ' ');
+			break;
+		case AT_AlterConstraint:
+			deparseATAlterConstraint(state, castNode(ATAlterConstraint, alter_table_cmd->def));
 			deparseAppendStringInfoChar(state, ' ');
 			break;
 		case AT_SetIdentity:
@@ -7797,22 +7886,6 @@ static void deparseTransactionStmt(DeparseState *state, TransactionStmt *transac
 	removeTrailingSpace(state);
 }
 
-// Determine if we hit SET TIME ZONE INTERVAL, that has special syntax not
-// supported for other SET statements
-static bool isSetTimeZoneInterval(VariableSetStmt* stmt)
-{
-	if (!(strcmp(stmt->name, "timezone") == 0 &&
-		  list_length(stmt->args) == 1 &&
-		  IsA(linitial(stmt->args), TypeCast)))
-		return false;
-
-	TypeName* typeName = castNode(TypeCast, linitial(stmt->args))->typeName;
-
-	return (list_length(typeName->names) == 2 &&
-		strcmp(strVal(linitial(typeName->names)), "pg_catalog") == 0 &&
-		strcmp(strVal(llast(typeName->names)), "interval") == 0);
-}
-
 static void deparseVariableSetStmt(DeparseState *state, VariableSetStmt* variable_set_stmt)
 {
 	ListCell *lc;
@@ -7823,10 +7896,21 @@ static void deparseVariableSetStmt(DeparseState *state, VariableSetStmt* variabl
 			deparseAppendStringInfoString(state, "SET ");
 			if (variable_set_stmt->is_local)
 				deparseAppendStringInfoString(state, "LOCAL ");
-			if (isSetTimeZoneInterval(variable_set_stmt))
+			if (strcmp(variable_set_stmt->name, "timezone") == 0 && variable_set_stmt->jumble_args)
 			{
 				deparseAppendStringInfoString(state, "TIME ZONE ");
 				deparseVarList(state, variable_set_stmt->args);
+			}
+			else if (strcmp(variable_set_stmt->name, "xmloption") == 0 && variable_set_stmt->jumble_args)
+			{
+				char *option = linitial_node(A_Const, variable_set_stmt->args)->val.sval.sval;
+				deparseAppendStringInfoString(state, "XML OPTION ");
+				if (strcmp(option, "DOCUMENT") == 0)
+					deparseAppendStringInfoString(state, "DOCUMENT ");
+				else if (strcmp(option, "CONTENT") == 0)
+					deparseAppendStringInfoString(state, "CONTENT ");
+				else
+					deparseVarList(state, variable_set_stmt->args);
 			}
 			else
 			{
@@ -7839,8 +7923,15 @@ static void deparseVariableSetStmt(DeparseState *state, VariableSetStmt* variabl
 			deparseAppendStringInfoString(state, "SET ");
 			if (variable_set_stmt->is_local)
 				deparseAppendStringInfoString(state, "LOCAL ");
-			deparseVarName(state, variable_set_stmt->name);
-			deparseAppendStringInfoString(state, " TO DEFAULT");
+			if (strcmp(variable_set_stmt->name, "timezone") == 0 && variable_set_stmt->jumble_args)
+			{
+				deparseAppendStringInfoString(state, "TIME ZONE DEFAULT");
+			}
+			else
+			{
+				deparseVarName(state, variable_set_stmt->name);
+				deparseAppendStringInfoString(state, " TO DEFAULT");
+			}
 			break;
 		case VAR_SET_CURRENT: /* SET var FROM CURRENT */
 			deparseAppendStringInfoString(state, "SET ");
@@ -8110,7 +8201,7 @@ static void deparseCopyStmt(DeparseState *state, CopyStmt *copy_stmt)
 		{
 			DefElem *def_elem = castNode(DefElem, lfirst(lc));
 
-			if (strcmp(def_elem->defname, "freeze") == 0 && optBooleanValue(def_elem->arg))
+			if (strcmp(def_elem->defname, "freeze") == 0 && def_elem->arg && optBooleanValue(def_elem->arg))
 			{}
 			else if (strcmp(def_elem->defname, "header") == 0 && def_elem->arg && optBooleanValue(def_elem->arg))
 			{}
@@ -8131,7 +8222,7 @@ static void deparseCopyStmt(DeparseState *state, CopyStmt *copy_stmt)
 			{
 				DefElem *def_elem = castNode(DefElem, lfirst(lc));
 
-				if (strcmp(def_elem->defname, "freeze") == 0 && optBooleanValue(def_elem->arg))
+				if (strcmp(def_elem->defname, "freeze") == 0 && def_elem->arg && optBooleanValue(def_elem->arg))
 				{
 					deparseAppendStringInfoString(state, "FREEZE ");
 				}
