@@ -5,6 +5,7 @@
  * - InterruptHoldoffCount
  * - QueryCancelHoldoffCount
  * - InterruptPending
+ * - MyDatabaseId
  *--------------------------------------------------------------------
  */
 
@@ -105,6 +106,7 @@ __thread volatile uint32 CritSectionCount = 0;
 
 
 
+__thread Oid			MyDatabaseId = InvalidOid;
 
 
 

@@ -1,7 +1,15 @@
 /*--------------------------------------------------------------------
  * Symbols referenced in this file:
  * - NameListToString
+ * - TypeIsVisible
+ * - isTempNamespace
+ * - myTempNamespace
  * - get_collation_oid
+ * - RangeVarGetRelidExtended
+ * - RelnameGetRelid
+ * - DeconstructQualifiedName
+ * - LookupExplicitNamespace
+ * - TypenameGetTypidExtended
  * - makeRangeVarFromNameList
  *--------------------------------------------------------------------
  */
@@ -206,6 +214,7 @@ typedef struct SearchPathCacheEntry
  * we either haven't made the TEMP namespace yet, or have successfully
  * committed its creation, depending on whether myTempNamespace is valid.
  */
+static __thread Oid	myTempNamespace = InvalidOid;
 
 
 
@@ -326,7 +335,209 @@ static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
  * Callback allows caller to check permissions or acquire additional locks
  * prior to grabbing the relation lock.
  */
+Oid
+RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
+						 uint32 flags,
+						 RangeVarGetRelidCallback callback, void *callback_arg)
+{
+	uint64		inval_count;
+	Oid			relId;
+	Oid			oldRelId = InvalidOid;
+	bool		retry = false;
+	bool		missing_ok = (flags & RVR_MISSING_OK) != 0;
 
+	/* verify that flags do no conflict */
+	Assert(!((flags & RVR_NOWAIT) && (flags & RVR_SKIP_LOCKED)));
+
+	/*
+	 * We check the catalog name and then ignore it.
+	 */
+	if (relation->catalogname)
+	{
+		if (strcmp(relation->catalogname, get_database_name(MyDatabaseId)) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cross-database references are not implemented: \"%s.%s.%s\"",
+							relation->catalogname, relation->schemaname,
+							relation->relname)));
+	}
+
+	/*
+	 * DDL operations can change the results of a name lookup.  Since all such
+	 * operations will generate invalidation messages, we keep track of
+	 * whether any such messages show up while we're performing the operation,
+	 * and retry until either (1) no more invalidation messages show up or (2)
+	 * the answer doesn't change.
+	 *
+	 * But if lockmode = NoLock, then we assume that either the caller is OK
+	 * with the answer changing under them, or that they already hold some
+	 * appropriate lock, and therefore return the first answer we get without
+	 * checking for invalidation messages.  Also, if the requested lock is
+	 * already held, LockRelationOid will not AcceptInvalidationMessages, so
+	 * we may fail to notice a change.  We could protect against that case by
+	 * calling AcceptInvalidationMessages() before beginning this loop, but
+	 * that would add a significant amount overhead, so for now we don't.
+	 */
+	for (;;)
+	{
+		/*
+		 * Remember this value, so that, after looking up the relation name
+		 * and locking its OID, we can check whether any invalidation messages
+		 * have been processed that might require a do-over.
+		 */
+		inval_count = SharedInvalidMessageCounter;
+
+		/*
+		 * Some non-default relpersistence value may have been specified.  The
+		 * parser never generates such a RangeVar in simple DML, but it can
+		 * happen in contexts such as "CREATE TEMP TABLE foo (f1 int PRIMARY
+		 * KEY)".  Such a command will generate an added CREATE INDEX
+		 * operation, which must be careful to find the temp table, even when
+		 * pg_temp is not first in the search path.
+		 */
+		if (relation->relpersistence == RELPERSISTENCE_TEMP)
+		{
+			if (!OidIsValid(myTempNamespace))
+				relId = InvalidOid; /* this probably can't happen? */
+			else
+			{
+				if (relation->schemaname)
+				{
+					Oid			namespaceId;
+
+					namespaceId = LookupExplicitNamespace(relation->schemaname, missing_ok);
+
+					/*
+					 * For missing_ok, allow a non-existent schema name to
+					 * return InvalidOid.
+					 */
+					if (namespaceId != myTempNamespace)
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+								 errmsg("temporary tables cannot specify a schema name")));
+				}
+
+				relId = get_relname_relid(relation->relname, myTempNamespace);
+			}
+		}
+		else if (relation->schemaname)
+		{
+			Oid			namespaceId;
+
+			/* use exact schema given */
+			namespaceId = LookupExplicitNamespace(relation->schemaname, missing_ok);
+			if (missing_ok && !OidIsValid(namespaceId))
+				relId = InvalidOid;
+			else
+				relId = get_relname_relid(relation->relname, namespaceId);
+		}
+		else
+		{
+			/* search the namespace path */
+			relId = RelnameGetRelid(relation->relname);
+		}
+
+		/*
+		 * Invoke caller-supplied callback, if any.
+		 *
+		 * This callback is a good place to check permissions: we haven't
+		 * taken the table lock yet (and it's really best to check permissions
+		 * before locking anything!), but we've gotten far enough to know what
+		 * OID we think we should lock.  Of course, concurrent DDL might
+		 * change things while we're waiting for the lock, but in that case
+		 * the callback will be invoked again for the new OID.
+		 */
+		if (callback)
+			callback(relation, relId, oldRelId, callback_arg);
+
+		/*
+		 * If no lock requested, we assume the caller knows what they're
+		 * doing.  They should have already acquired a heavyweight lock on
+		 * this relation earlier in the processing of this same statement, so
+		 * it wouldn't be appropriate to AcceptInvalidationMessages() here, as
+		 * that might pull the rug out from under them.
+		 */
+		if (lockmode == NoLock)
+			break;
+
+		/*
+		 * If, upon retry, we get back the same OID we did last time, then the
+		 * invalidation messages we processed did not change the final answer.
+		 * So we're done.
+		 *
+		 * If we got a different OID, we've locked the relation that used to
+		 * have this name rather than the one that does now.  So release the
+		 * lock.
+		 */
+		if (retry)
+		{
+			if (relId == oldRelId)
+				break;
+			if (OidIsValid(oldRelId))
+				UnlockRelationOid(oldRelId, lockmode);
+		}
+
+		/*
+		 * Lock relation.  This will also accept any pending invalidation
+		 * messages.  If we got back InvalidOid, indicating not found, then
+		 * there's nothing to lock, but we accept invalidation messages
+		 * anyway, to flush any negative catcache entries that may be
+		 * lingering.
+		 */
+		if (!OidIsValid(relId))
+			AcceptInvalidationMessages();
+		else if (!(flags & (RVR_NOWAIT | RVR_SKIP_LOCKED)))
+			LockRelationOid(relId, lockmode);
+		else if (!ConditionalLockRelationOid(relId, lockmode))
+		{
+			int			elevel = (flags & RVR_SKIP_LOCKED) ? DEBUG1 : ERROR;
+
+			if (relation->schemaname)
+				ereport(elevel,
+						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+						 errmsg("could not obtain lock on relation \"%s.%s\"",
+								relation->schemaname, relation->relname)));
+			else
+				ereport(elevel,
+						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+						 errmsg("could not obtain lock on relation \"%s\"",
+								relation->relname)));
+
+			return InvalidOid;
+		}
+
+		/*
+		 * If no invalidation message were processed, we're done!
+		 */
+		if (inval_count == SharedInvalidMessageCounter)
+			break;
+
+		/*
+		 * Something may have changed.  Let's repeat the name lookup, to make
+		 * sure this name still references the same relation it did
+		 * previously.
+		 */
+		retry = true;
+		oldRelId = relId;
+	}
+
+	if (!OidIsValid(relId))
+	{
+		int			elevel = missing_ok ? DEBUG1 : ERROR;
+
+		if (relation->schemaname)
+			ereport(elevel,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("relation \"%s.%s\" does not exist",
+							relation->schemaname, relation->relname)));
+		else
+			ereport(elevel,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("relation \"%s\" does not exist",
+							relation->relname)));
+	}
+	return relId;
+}
 
 /*
  * RangeVarGetCreationNamespace
@@ -378,6 +589,12 @@ static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
  *		Try to resolve an unqualified relation name.
  *		Returns OID if relation found in search path, else InvalidOid.
  */
+Oid
+RelnameGetRelid(const char *relname)
+{
+	elog(ERROR, "Not implemented");
+}
+
 
 
 
@@ -411,6 +628,23 @@ static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
  *
  * This is essentially the same as RelnameGetRelid.
  */
+Oid
+TypenameGetTypidExtended(const char *typname, bool temp_ok)
+{
+    if (strcmp(typname, "timestamptz") == 0)
+        return TIMESTAMPTZOID;
+    else if (strcmp(typname, "uuid") == 0)
+        return UUIDOID;
+    else if (strcmp(typname, "bool") == 0)
+        return BOOLOID;
+    else if (strcmp(typname, "text") == 0)
+        return TEXTOID;
+    else if (strcmp(typname, "date") == 0)
+        return DATEOID;
+    else
+        return UNKNOWNOID;
+}
+
 
 
 /*
@@ -420,6 +654,10 @@ static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
  *		for the unqualified type name".
  */
 
+bool
+TypeIsVisible(Oid typid)
+{
+return true;}
 
 /*
  * TypeIsVisibleExt
@@ -831,7 +1069,49 @@ static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
  *
  * *nspname_p is set to NULL if there is no explicit schema name.
  */
+void
+DeconstructQualifiedName(const List *names,
+						 char **nspname_p,
+						 char **objname_p)
+{
+	char	   *catalogname;
+	char	   *schemaname = NULL;
+	char	   *objname = NULL;
 
+	switch (list_length(names))
+	{
+		case 1:
+			objname = strVal(linitial(names));
+			break;
+		case 2:
+			schemaname = strVal(linitial(names));
+			objname = strVal(lsecond(names));
+			break;
+		case 3:
+			catalogname = strVal(linitial(names));
+			schemaname = strVal(lsecond(names));
+			objname = strVal(lthird(names));
+
+			/*
+			 * We check the catalog name and then ignore it.
+			 */
+			if (strcmp(catalogname, get_database_name(MyDatabaseId)) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cross-database references are not implemented: %s",
+								NameListToString(names))));
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("improper qualified name (too many dotted names): %s",
+							NameListToString(names))));
+			break;
+	}
+
+	*nspname_p = schemaname;
+	*objname_p = objname;
+}
 
 /*
  * LookupNamespaceNoError
@@ -852,6 +1132,34 @@ static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
  *
  * Returns the namespace OID
  */
+Oid
+LookupExplicitNamespace(const char *nspname, bool missing_ok)
+{
+	Oid			namespaceId;
+	AclResult	aclresult;
+
+	/* check for pg_temp alias */
+	if (strcmp(nspname, "pg_temp") == 0)
+	{
+		if (OidIsValid(myTempNamespace))
+			return myTempNamespace;
+
+		/*
+		 * Since this is used only for looking up existing objects, there is
+		 * no point in trying to initialize the temp namespace here; and doing
+		 * so might create problems for some callers --- just fall through.
+		 */
+	}
+
+    if (strcmp(nspname, "pg_catalog") == 0)
+        return PG_CATALOG_NAMESPACE;
+
+    if (strcmp(nspname, "public") == 0)
+        return PG_PUBLIC_NAMESPACE;
+
+    elog(ERROR, "Not implemented (LookupExplicitNamespace only supports pg_catalog)");
+}
+
 
 
 /*
@@ -980,7 +1288,13 @@ NameListToString(const List *names)
 /*
  * isTempNamespace - is the given namespace my temporary-table namespace?
  */
-
+bool
+isTempNamespace(Oid namespaceId)
+{
+	if (OidIsValid(myTempNamespace) && myTempNamespace == namespaceId)
+		return true;
+	return false;
+}
 
 /*
  * isTempToastNamespace - is the given namespace my temporary-toast-table
@@ -1088,8 +1402,11 @@ NameListToString(const List *names)
  * Note that this will only find collations that work with the current
  * database's encoding.
  */
-Oid get_collation_oid(List *name, bool missing_ok) { return DEFAULT_COLLATION_OID; }
 
+Oid
+get_collation_oid(List *collname, bool missing_ok)
+{
+return DEFAULT_COLLATION_OID;}
 
 /*
  * get_conversion_oid - find a conversion by possibly qualified name
@@ -1128,6 +1445,11 @@ Oid get_collation_oid(List *name, bool missing_ok) { return DEFAULT_COLLATION_OI
  * recomputeNamespacePath - recompute path derived variables if needed.
  */
 
+static void
+recomputeNamespacePath(void)
+{
+	/* Do nothing */
+}
 
 /*
  * AccessTempTableNamespace

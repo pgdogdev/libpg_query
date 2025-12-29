@@ -204,7 +204,7 @@ extern PGDLLIMPORT char pkglib_path[];
 extern PGDLLIMPORT char postgres_exec_path[];
 #endif
 
-extern PGDLLIMPORT Oid MyDatabaseId;
+extern PGDLLIMPORT __thread Oid MyDatabaseId;
 
 extern PGDLLIMPORT Oid MyDatabaseTableSpace;
 

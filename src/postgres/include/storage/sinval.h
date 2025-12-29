@@ -135,7 +135,7 @@ typedef union
 
 
 /* Counter of messages processed; don't worry about overflow. */
-extern PGDLLIMPORT uint64 SharedInvalidMessageCounter;
+extern PGDLLIMPORT __thread uint64 SharedInvalidMessageCounter;
 
 extern PGDLLIMPORT volatile sig_atomic_t catchupInterruptPending;
 

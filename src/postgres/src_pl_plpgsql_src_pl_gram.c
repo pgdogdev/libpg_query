@@ -6300,9 +6300,8 @@ plpgsql_sql_error_callback(void *arg)
  * This is handled the same as in check_sql_expr(), and we likewise
  * expect that the given string is a copy from the source text.
  */
-
 #include "catalog/pg_collation_d.h"
-static PLpgSQL_type * parse_datatype(const char *string, int location, yyscan_t yyscanner){
+static PLpgSQL_type * parse_datatype(const char *string, int location, yyscan_t yyscanner) {
 	PLpgSQL_type *typ;
 
 	/* Ignore trailing spaces */
